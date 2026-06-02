@@ -82,28 +82,46 @@ class BinanceService
         );
     }
 
-    public function getKlines(string $symbol, string $interval, int $limit = 100): array
+    // $timeframe: '1D', '1W', '1M'
+    public function getKlines(string $symbol, string $timeframe, int $limit = 250): array
     {
-        try {
-            $response = $this->client->get('/fapi/v1/klines', [
-                'query' => compact('symbol', 'interval', 'limit'),
-            ]);
+        $interval = match($timeframe) {
+            '1D' => '1d',
+            '1W' => '1w',
+            '1M' => '1M',
+            default => '1d',
+        };
 
-            $klines = json_decode($response->getBody()->getContents(), true) ?? [];
+        $cacheKey = "binance_klines_{$symbol}_{$interval}_{$limit}";
+        $ttl = match($timeframe) {
+            '1D' => 3600,
+            '1W' => 21600,
+            '1M' => 86400,
+            default => 3600,
+        };
 
-            return array_map(fn($k) => [
-                'open_time' => $k[0],
-                'open' => (float) $k[1],
-                'high' => (float) $k[2],
-                'low' => (float) $k[3],
-                'close' => (float) $k[4],
-                'volume' => (float) $k[5],
-                'close_time' => $k[6],
-            ], $klines);
-        } catch (RequestException $e) {
-            Log::error("Binance klines fetch failed for {$symbol}: " . $e->getMessage());
-            return [];
-        }
+        return Cache::remember($cacheKey, $ttl, function () use ($symbol, $interval, $limit) {
+            try {
+                $response = $this->client->get('/fapi/v1/klines', [
+                    'query' => compact('symbol', 'interval', 'limit'),
+                ]);
+
+                $klines = json_decode($response->getBody()->getContents(), true) ?? [];
+
+                return array_map(fn($k) => [
+                    'open_time' => $k[0],
+                    'open' => (float) $k[1],
+                    'high' => (float) $k[2],
+                    'low' => (float) $k[3],
+                    'close' => (float) $k[4],
+                    'volume' => (float) $k[5],
+                    'close_time' => $k[6],
+                ], $klines);
+            } catch (RequestException $e) {
+                Log::error("Binance klines fetch failed for {$symbol}/{$interval}: " . $e->getMessage());
+                return [];
+            }
+        });
     }
 
     private function getDefaultSymbols(): array

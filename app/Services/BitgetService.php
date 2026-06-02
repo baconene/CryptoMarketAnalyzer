@@ -97,39 +97,55 @@ class BitgetService
         }
     }
 
-    public function getKlines(string $symbol, string $granularity, int $limit = 100): array
+    // $timeframe: '1D', '1W', '1M'
+    public function getKlines(string $symbol, string $timeframe, int $limit = 250): array
     {
+        $granularity = match($timeframe) {
+            '1D' => '1Dutc',
+            '1W' => '1Wutc',
+            '1M' => '1Mutc',
+            default => '1Dutc',
+        };
+
         $normalizedSymbol = str_contains($symbol, '_UMCBL') ? $symbol : $symbol . '_UMCBL';
 
-        try {
-            $response = $this->client->get('/api/mix/v1/market/candles', [
-                'query' => [
-                    'symbol' => $normalizedSymbol,
-                    'granularity' => $granularity,
-                    'limit' => $limit,
-                ],
-            ]);
+        $cacheKey = "bitget_klines_{$symbol}_{$granularity}_{$limit}";
+        $ttl = match($timeframe) {
+            '1D' => 3600,
+            '1W' => 21600,
+            '1M' => 86400,
+            default => 3600,
+        };
 
-            $data = json_decode($response->getBody()->getContents(), true);
+        return Cache::remember($cacheKey, $ttl, function () use ($normalizedSymbol, $granularity, $limit) {
+            try {
+                $response = $this->client->get('/api/v2/mix/market/candles', [
+                    'query' => [
+                        'symbol' => $normalizedSymbol,
+                        'granularity' => $granularity,
+                        'limit' => $limit,
+                        'productType' => 'usdt-futures',
+                    ],
+                ]);
 
-            return array_map(fn($k) => [
-                'open_time' => $k[0],
-                'open' => (float) $k[1],
-                'high' => (float) $k[2],
-                'low' => (float) $k[3],
-                'close' => (float) $k[4],
-                'volume' => (float) $k[5],
-            ], $data['data'] ?? []);
-        } catch (RequestException $e) {
-            Log::error("Bitget klines fetch failed for {$symbol}: " . $e->getMessage());
-            return [];
-        }
-    }
+                $data = json_decode($response->getBody()->getContents(), true);
 
-    // Map interval to TradingView exchange format for Bitget
-    public function getTradingViewExchange(): string
-    {
-        return 'BITGET';
+                // Bitget v2 returns array of arrays: [ts, open, high, low, close, volume, quoteVol]
+                $rows = $data['data'] ?? [];
+
+                return array_map(fn($k) => [
+                    'open_time' => $k[0],
+                    'open' => (float) $k[1],
+                    'high' => (float) $k[2],
+                    'low' => (float) $k[3],
+                    'close' => (float) $k[4],
+                    'volume' => (float) $k[5],
+                ], $rows);
+            } catch (RequestException $e) {
+                Log::error("Bitget klines fetch failed for {$normalizedSymbol}/{$granularity}: " . $e->getMessage());
+                return [];
+            }
+        });
     }
 
     private function getDefaultSymbols(): array
