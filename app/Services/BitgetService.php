@@ -13,6 +13,13 @@ class BitgetService
 
     private const BASE_URL = 'https://api.bitget.com';
 
+    // v1 granularity strings
+    private const GRANULARITY = [
+        '1D' => '1D',
+        '1W' => '1W',
+        '1M' => '1M',
+    ];
+
     public function __construct()
     {
         $this->client = new Client([
@@ -22,94 +29,62 @@ class BitgetService
         ]);
     }
 
-    public function getFuturesSymbols(string $productType = 'umcbl'): array
+    public function getAllTickers(): array
     {
-        return Cache::remember("bitget_futures_symbols_{$productType}", 3600, function () use ($productType) {
-            try {
-                $response = $this->client->get('/api/mix/v1/market/contracts', [
-                    'query' => ['productType' => $productType],
-                ]);
-
-                $data = json_decode($response->getBody()->getContents(), true);
-
-                $symbols = array_map(
-                    fn($s) => $s['symbolName'] ?? null,
-                    $data['data'] ?? []
-                );
-
-                return array_values(array_filter($symbols, fn($s) => $s && str_contains($s, 'USDT')));
-            } catch (RequestException $e) {
-                Log::error('Bitget symbol fetch failed: ' . $e->getMessage());
-                return $this->getDefaultSymbols();
-            }
-        });
-    }
-
-    public function getAllTickers(string $productType = 'umcbl'): array
-    {
-        return Cache::remember("bitget_all_tickers_{$productType}", 60, function () use ($productType) {
-            try {
-                $response = $this->client->get('/api/mix/v1/market/tickers', [
-                    'query' => ['productType' => $productType],
-                ]);
-
-                $data = json_decode($response->getBody()->getContents(), true);
-
-                return collect($data['data'] ?? [])
-                    ->filter(fn($t) => str_contains($t['symbol'] ?? '', 'USDT'))
-                    ->sortByDesc(fn($t) => (float) ($t['usdtVolume'] ?? $t['baseVolume'] ?? 0))
-                    ->values()
-                    ->toArray();
-            } catch (RequestException $e) {
-                Log::error('Bitget all tickers fetch failed: ' . $e->getMessage());
-                return [];
-            }
-        });
-    }
-
-    public function getTopSymbolsByVolume(int $limit = 50, string $productType = 'umcbl'): array
-    {
-        $tickers = $this->getAllTickers($productType);
-
-        $symbols = array_column(array_slice($tickers, 0, $limit), 'symbol');
-
-        // Bitget symbols are like BTCUSDT_UMCBL, normalize to just BTCUSDT
-        return array_map(
-            fn($s) => str_replace(['_UMCBL', '_DMCBL', '_CMCBL'], '', $s),
-            $symbols
-        );
-    }
-
-    public function getTicker(string $symbol, string $productType = 'umcbl'): array
-    {
-        $normalizedSymbol = $symbol . '_UMCBL';
+        $key = 'bitget_all_tickers';
+        $cached = Cache::get($key);
+        if (!empty($cached)) {
+            return $cached;
+        }
 
         try {
-            $response = $this->client->get('/api/mix/v1/market/ticker', [
-                'query' => ['symbol' => $normalizedSymbol],
+            // v1 tickers — returns symbols like BTCUSDT_UMCBL
+            $response = $this->client->get('/api/mix/v1/market/tickers', [
+                'query' => ['productType' => 'umcbl'],
             ]);
 
             $data = json_decode($response->getBody()->getContents(), true);
-            return $data['data'] ?? [];
+
+            $result = collect($data['data'] ?? [])
+                ->filter(fn($t) => str_contains($t['symbol'] ?? '', 'USDT'))
+                ->sortByDesc(fn($t) => (float) ($t['usdtVolume'] ?? $t['baseVolume'] ?? 0))
+                ->values()
+                ->toArray();
+
+            if (!empty($result)) {
+                Cache::put($key, $result, 60);
+            }
+
+            return $result;
         } catch (RequestException $e) {
-            Log::error("Bitget ticker fetch failed for {$symbol}: " . $e->getMessage());
+            Log::error('Bitget tickers failed: ' . $e->getMessage());
             return [];
         }
     }
 
-    // $timeframe: '1D', '1W', '1M'
-    public function getKlines(string $symbol, string $timeframe, int $limit = 250): array
+    public function getTopSymbolsByVolume(int $limit = 50): array
     {
-        $granularity = match($timeframe) {
-            '1D' => '1Dutc',
-            '1W' => '1Wutc',
-            '1M' => '1Mutc',
-            default => '1Dutc',
-        };
+        $symbols = array_column(
+            array_slice($this->getAllTickers(), 0, $limit),
+            'symbol'
+        );
 
-        $normalizedSymbol = str_contains($symbol, '_UMCBL') ? $symbol : $symbol . '_UMCBL';
+        // Strip exchange suffix: BTCUSDT_UMCBL → BTCUSDT
+        return array_map(
+            fn($s) => preg_replace('/_[A-Z]+$/', '', $s),
+            $symbols
+        );
+    }
 
-        $cacheKey = "bitget_klines_{$symbol}_{$granularity}_{$limit}";
+    // $timeframe: '1D', '1W', '1M'
+    // Uses v1 API consistently with _UMCBL symbol format
+    public function getKlines(string $symbol, string $timeframe, int $limit = 200): array
+    {
+        $granularity = self::GRANULARITY[$timeframe] ?? '1D';
+
+        // v1 requires the _UMCBL suffix
+        $apiSymbol = str_contains($symbol, '_UMCBL') ? $symbol : $symbol . '_UMCBL';
+
         $ttl = match($timeframe) {
             '1D' => 3600,
             '1W' => 21600,
@@ -117,42 +92,48 @@ class BitgetService
             default => 3600,
         };
 
-        return Cache::remember($cacheKey, $ttl, function () use ($normalizedSymbol, $granularity, $limit) {
-            try {
-                $response = $this->client->get('/api/v2/mix/market/candles', [
-                    'query' => [
-                        'symbol' => $normalizedSymbol,
-                        'granularity' => $granularity,
-                        'limit' => $limit,
-                        'productType' => 'usdt-futures',
-                    ],
-                ]);
+        $key = "bitget_klines_{$symbol}_{$granularity}";
+        $cached = Cache::get($key);
+        if (!empty($cached)) {
+            return $cached;
+        }
 
-                $data = json_decode($response->getBody()->getContents(), true);
+        try {
+            $response = $this->client->get('/api/mix/v1/market/candles', [
+                'query' => [
+                    'symbol'      => $apiSymbol,
+                    'granularity' => $granularity,
+                    'limit'       => $limit,
+                ],
+            ]);
 
-                // Bitget v2 returns array of arrays: [ts, open, high, low, close, volume, quoteVol]
-                $rows = $data['data'] ?? [];
+            $data = json_decode($response->getBody()->getContents(), true);
 
-                return array_map(fn($k) => [
-                    'open_time' => $k[0],
-                    'open' => (float) $k[1],
-                    'high' => (float) $k[2],
-                    'low' => (float) $k[3],
-                    'close' => (float) $k[4],
-                    'volume' => (float) $k[5],
-                ], $rows);
-            } catch (RequestException $e) {
-                Log::error("Bitget klines fetch failed for {$normalizedSymbol}/{$granularity}: " . $e->getMessage());
-                return [];
+            // v1 response: {code, data: [[ts, open, high, low, close, vol, quoteVol], ...]}
+            $rows = $data['data'] ?? [];
+
+            // Some versions return the array directly (not nested)
+            if (!empty($rows) && !is_array($rows[0])) {
+                $rows = $data;
             }
-        });
-    }
 
-    private function getDefaultSymbols(): array
-    {
-        return [
-            'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'XRPUSDT', 'SOLUSDT',
-            'ADAUSDT', 'DOGEUSDT', 'AVAXUSDT', 'DOTUSDT', 'MATICUSDT',
-        ];
+            $klines = array_map(fn($k) => [
+                'open_time' => (int) $k[0],
+                'open'      => (float) $k[1],
+                'high'      => (float) $k[2],
+                'low'       => (float) $k[3],
+                'close'     => (float) $k[4],
+                'volume'    => (float) $k[5],
+            ], $rows);
+
+            if (!empty($klines)) {
+                Cache::put($key, $klines, $ttl);
+            }
+
+            return $klines;
+        } catch (RequestException $e) {
+            Log::error("Bitget klines failed {$apiSymbol}/{$granularity}: " . $e->getMessage());
+            return [];
+        }
     }
 }
